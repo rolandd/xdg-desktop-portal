@@ -4,6 +4,8 @@
 # This file is formatted with Python Black
 
 import os
+import threading
+import time
 from pathlib import Path
 
 import dbus
@@ -334,6 +336,89 @@ class TestDocuments:
 
         host_path = xdp_doc.get_host_path_attr(mountpoint / doc_id / "a" / "b" / "c")
         assert host_path == base_path / "b" / "c"
+
+    def test_add_as_needed_by_app_reentrancy(
+        self, xdg_document_portal, dbus_con, xdp_bin_path
+    ):
+        documents_intf = xdp.get_document_portal_iface(dbus_con)
+
+        # 1. Create a document so we can perform a concurrent Info call on it
+        content1 = b"file1-content"
+        file1 = Path(os.environ["TMPDIR"]) / "test-doc-1"
+        xdp_doc.write_bytes_atomic(file1, content1)
+        doc_id1 = xdp_doc.export_file(documents_intf, file1)
+        assert doc_id1
+
+        # 2. Prepare file2 to be exported with DOCUMENT_ADD_FLAGS_AS_NEEDED_BY_APP
+        file2 = Path(os.environ["TMPDIR"]) / "test-doc-2"
+        xdp_doc.write_bytes_atomic(file2, b"file2-content")
+
+        # 3. Create mock 'flatpak' that delays response slightly
+        mock_flatpak = xdp_bin_path / "flatpak"
+        mock_flatpak.write_text("#!/bin/sh\n/bin/sleep 0.2\necho 'read-write'\n")
+        mock_flatpak.chmod(0o755)
+
+        # 4. Prepare concurrent D-Bus interface and warm it up so sender is cached
+        concurrent_bus = dbus.SessionBus(private=True)
+        concurrent_obj = concurrent_bus.get_object(
+            "org.freedesktop.portal.Documents",
+            "/org/freedesktop/portal/documents",
+        )
+        concurrent_intf = dbus.Interface(
+            concurrent_obj, "org.freedesktop.portal.Documents"
+        )
+        path, _apps = concurrent_intf.Info(doc_id1)
+        assert path
+
+        # 5. Launch concurrent thread issuing an Info D-Bus call while AddFull is in-flight
+        concurrent_result = []
+        concurrent_error = []
+
+        def call_info():
+            try:
+                time.sleep(0.05)
+                res = concurrent_intf.Info(doc_id1, timeout=5)
+                concurrent_result.append(res)
+            except dbus.exceptions.DBusException as e:
+                concurrent_error.append(e)
+
+        thread = threading.Thread(target=call_info)
+        thread.start()
+
+        DOCUMENT_ADD_FLAGS_AS_NEEDED_BY_APP = 1 << 2
+        file2_fd = os.open(file2.absolute().as_posix(), os.O_PATH | os.O_CLOEXEC)
+        deadlock_detected = False
+        try:
+            try:
+                doc_ids, _extra = documents_intf.AddFull(
+                    [file2_fd],
+                    DOCUMENT_ADD_FLAGS_AS_NEEDED_BY_APP,
+                    "org.test.App",
+                    ["read"],
+                    byte_arrays=True,
+                    timeout=2,
+                )
+            except dbus.exceptions.DBusException as e:
+                if "NoReply" in str(e) or "Timeout" in str(e):
+                    deadlock_detected = True
+                    raise AssertionError(
+                        "Deadlock detected: AddFull timed out waiting for reply"
+                    ) from e
+                raise
+            finally:
+                thread.join(timeout=2)
+                if thread.is_alive():
+                    deadlock_detected = True
+
+            assert not thread.is_alive(), "Concurrent Info call timed out (deadlock!)"
+            assert not concurrent_error, f"Concurrent call failed: {concurrent_error}"
+            assert len(concurrent_result) == 1
+            assert doc_ids == [""]
+        finally:
+            os.close(file2_fd)
+            if deadlock_detected:
+                xdg_document_portal.kill()
+                xdg_document_portal.wait()
 
 
 try:

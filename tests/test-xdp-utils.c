@@ -194,6 +194,40 @@ test_app_id_via_systemd_unit (void)
 }
 #endif /* HAVE_LIBSYSTEMD */
 
+static gboolean default_context_dispatched = FALSE;
+
+static gboolean
+idle_cb (gpointer data)
+{
+  default_context_dispatched = TRUE;
+  return G_SOURCE_REMOVE;
+}
+
+static void
+test_spawn_isolates_context (void)
+{
+  g_autoptr(GError) error = NULL;
+  g_autofree char *output = NULL;
+  g_autoptr(GSource) source = g_idle_source_new ();
+
+  g_source_set_callback (source, idle_cb, NULL, NULL);
+  g_source_attach (source, NULL); /* Attached to default global GMainContext */
+
+  default_context_dispatched = FALSE;
+
+  output = xdp_spawn (&error, "true", NULL);
+  g_assert_no_error (error);
+
+  /* The nested main loop in xdp_spawn_full() must run on a dedicated
+   * GMainContext and must NOT dispatch events attached to the default
+   * GMainContext. */
+  g_assert_false (default_context_dispatched);
+
+  /* Now iterate the default context and verify the idle source is dispatched */
+  g_main_context_iteration (NULL, FALSE);
+  g_assert_true (default_context_dispatched);
+}
+
 int main (int argc, char **argv)
 {
   g_test_init (&argc, &argv, NULL);
@@ -205,5 +239,6 @@ int main (int argc, char **argv)
 #if HAVE_LIBSYSTEMD
   g_test_add_func ("/app-id-via-systemd-unit", test_app_id_via_systemd_unit);
 #endif
+  g_test_add_func ("/spawn/isolates-context", test_spawn_isolates_context);
   return g_test_run ();
 }
